@@ -1,0 +1,12 @@
+# 构建产物
+/out/
+/server
+courtbook
+*.exe
+
+# 本地环境
+.env
+*.log
+
+# Go
+/vendor/

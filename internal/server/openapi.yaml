@@ -1,0 +1,980 @@
+openapi: 3.0.3
+info:
+  title: 城市体育馆羽毛球场地预约 · 灯控计费与爽约处罚服务
+  version: 1.0.0
+  description: |
+    覆盖预约下单、支付锁场、闸机放行、灯控预热/开关、延时与超员计费、退订规则、
+    爽约/迟到/场馆原因判定、退款申请与客服争议裁决、场馆运营（维护锁定、临时加场、
+    会员优先预约、高峰退订与爽约处罚规则）的完整后端 API。
+
+    ## 核心设计
+    - **并发防重复锁定**：PostgreSQL `btree_gist` 排他约束保证同一场地有效订单时段不重叠。
+    - **灯控预热独立状态**：`warmup` 订单不参与支付超时释放。
+    - **事件溯源式台账**：`booking_events`（闸机/灯控/前台/系统）+ `billing_ledger`（每条费用注明来源）
+      + `ops_events`（运营操作），客服处理争议时无需猜测订单表。
+    - **爽约判定**：综合闸机扫码、灯控开启、前台签到、退款申请、维护锁定五类信号。
+      灯开 ≠ 人上场；闸机/前台信号才是到场依据。
+
+    ## 认证
+    - 员工接口：`Authorization: Bearer <staff_token>`（admin/operator/frontdesk/cs）
+    - 会员接口：`Authorization: Bearer <member_token>`（手机号 + 固定验证码 123456）
+    - 硬件回调：`X-Device-Key: device-key-123`
+servers:
+  - url: /
+    description: 本机/容器
+tags:
+  - name: 认证
+  - name: 会员预约
+  - name: 硬件回调
+  - name: 前台
+  - name: 运营端
+  - name: 客服争议
+paths:
+  /healthz:
+    get:
+      tags: [认证]
+      summary: 健康检查
+      responses:
+        '200': { description: OK }
+
+  /api/auth/staff/login:
+    post:
+      tags: [认证]
+      summary: 员工登录
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, example: admin }
+                password: { type: string, example: admin123 }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  staff: { $ref: '#/components/schemas/Staff' }
+        '401': { description: 用户名或密码错误 }
+
+  /api/auth/member/login:
+    post:
+      tags: [认证]
+      summary: 会员登录（演示环境短信验证码固定 123456；新手机号自动注册）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, sms_code]
+              properties:
+                phone: { type: string, example: "13800000002" }
+                name: { type: string, example: 李四 }
+                sms_code: { type: string, example: "123456" }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  member: { $ref: '#/components/schemas/Member' }
+        '401': { description: 验证码错误 }
+
+  /api/venues:
+    get:
+      tags: [会员预约]
+      summary: 场馆与场地列表（需员工登录）
+      security: [{ staffAuth: [] }]
+      responses:
+        '200': { description: OK }
+
+  /api/catalog:
+    get:
+      tags: [会员预约]
+      summary: 会员浏览目录（场馆、场地、分时段价格、运营策略摘要）
+      security: [{ memberAuth: [] }]
+      responses:
+        '200': { description: OK }
+
+  /api/members/me/credits:
+    get:
+      tags: [会员预约]
+      summary: 我的补偿时长余额（分钟）
+      security: [{ memberAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  remaining_minutes: { type: integer }
+
+  /api/members/me/bookings:
+    get:
+      tags: [会员预约]
+      summary: 我的预约列表
+      security: [{ memberAuth: [] }]
+      responses:
+        '200': { description: OK }
+
+  /api/bookings/quote:
+    post:
+      tags: [会员预约]
+      summary: 报价（不落库、不锁场）—— 跨高峰按时段分片、会员折扣、补偿时长抵扣、租拍购球
+      security: [{ memberAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookingInput' }
+      responses:
+        '200':
+          description: 报价结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+
+  /api/bookings:
+    post:
+      tags: [会员预约]
+      summary: 创建预约（同时锁定场地；冲突返回 409）
+      description: |
+        服务端校验：维护锁定、营业时间（非营业时间需有临时加场）、会员可提前预约天数、封禁状态。
+        并发抢同一场地时仅一笔成功（GiST 排他约束）。订单进入 `pending_payment`，需在支付超时前付款。
+      security: [{ memberAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookingInput' }
+      responses:
+        '201': { description: 创建成功，返回订单与报价 }
+        '409': { description: 场地该时段已被锁定 / 处于维护锁定 }
+        '422': { description: 超员 / 超出提前预约天数 / 非营业时间 / 已被封禁 }
+
+  /api/bookings/{id}:
+    get:
+      tags: [会员预约]
+      summary: 查看订单
+      security: [{ memberAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '403': { description: 无权查看他人订单 }
+
+  /api/bookings/{id}/pay:
+    post:
+      tags: [会员预约]
+      summary: 支付（模拟支付网关回调），成功后发放入场码
+      description: 超过 pay_deadline 的订单支付被拒（408），场地已由调度器释放。
+      security: [{ memberAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                method: { type: string, default: wechat }
+      responses:
+        '200':
+          description: 支付成功（幂等），订单变为 paid_waiting
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '408': { description: 支付已超时 }
+
+  /api/bookings/{id}/cancel:
+    post:
+      tags: [会员预约]
+      summary: 会员退订（按高峰/非高峰退订规则扣违约金并退款）
+      security: [{ memberAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+                venue_fault:
+                  type: boolean
+                  description: 会员不允许置 true（场馆原因退订走前台/争议）
+                  default: false
+      responses:
+        '200':
+          description: 退订结果（违约金、退款金额、台账）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CancelResult' }
+
+  /api/bookings/{id}/refund-requests:
+    post:
+      tags: [会员预约]
+      summary: 提交退款申请（等待客服审批）
+      security: [{ memberAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                amount_cents: { type: integer, description: 留空默认申请全部可退余额 }
+                reason: { type: string }
+      responses:
+        '201': { description: 已提交 }
+
+  /api/venues/{id}/availability:
+    get:
+      tags: [会员预约]
+      summary: 查询某日场地占用视图（有效预约 + 维护锁定 + 临时加场）
+      security: [{ memberAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        '200': { description: OK }
+
+  /api/devices/gate/scan:
+    post:
+      tags: [硬件回调]
+      summary: 闸机扫码放行
+      description: |
+        放行条件：已支付且处于入场窗口（默认开场前 20 分钟 ~ 开场后 30 分钟）。
+        前一场延时未结束时，标记 arrival_status=waiting（在场边等待）。
+        开场宽限（10 分钟）后入场判迟到并计迟到罚金。signal_id 保证硬件重放幂等。
+      security: [{ deviceAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [entry_code]
+              properties:
+                entry_code: { type: string }
+                gate_id: { type: string, default: G1 }
+                signal_id: { type: string, description: 硬件信号唯一 ID，用于幂等去重 }
+      responses:
+        '200': { description: admitted=true 放行 / duplicate=true 重复信号 }
+        '403': { description: 拒绝放行（未支付/未到时间/码无效） }
+
+  /api/devices/light/warmup:
+    post:
+      tags: [硬件回调]
+      summary: 灯控预热（paid_waiting → warmup，独立状态，支付超时释放不再生效）
+      security: [{ deviceAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [booking_id]
+              properties:
+                booking_id: { type: integer, format: int64 }
+                signal_id: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+
+  /api/devices/light/on:
+    post:
+      tags: [硬件回调]
+      summary: 开灯（warmup/paid_waiting → in_play）。灯开不代表用户上场。
+      security: [{ deviceAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+
+  /api/devices/light/off:
+    post:
+      tags: [硬件回调]
+      summary: 关灯并结算延时（15 分钟向上进位，补偿时长优先抵扣）
+      security: [{ deviceAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [booking_id]
+              properties:
+                booking_id: { type: integer, format: int64 }
+                off_at: { type: string, format: date-time, description: 留空取当前时间 }
+                signal_id: { type: string }
+      responses:
+        '200':
+          description: 结算结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LightOffResult' }
+
+  /api/staff/bookings/{id}:
+    get:
+      tags: [前台]
+      summary: 查看订单 + 事件流 + 计费台账
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      responses:
+        '200': { description: OK }
+
+  /api/staff/bookings/{id}/frontdesk-sign:
+    post:
+      tags: [前台]
+      summary: 前台人工签到（迟到判定/罚金同一规则）
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string }
+      responses:
+        '200': { description: OK }
+
+  /api/staff/bookings/{id}/waiting:
+    post:
+      tags: [前台]
+      summary: 登记「已在场边等待」（前一场延时灰度场景）
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      responses:
+        '200': { description: OK }
+
+  /api/staff/bookings/{id}/comp-minutes:
+    post:
+      tags: [前台]
+      summary: 前台当场补偿时长（灯控故障/前序等待），当场抵扣延时
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [minutes]
+              properties:
+                minutes: { type: integer, minimum: 1 }
+                note: { type: string }
+      responses:
+        '200': { description: OK }
+
+  /api/staff/bookings/{id}/players:
+    post:
+      tags: [前台]
+      summary: 现场上报实际人数（会员带朋友拼场导致超员 → 超员费）
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [players]
+              properties:
+                players: { type: integer, minimum: 1 }
+      responses:
+        '200': { description: OK }
+
+  /api/staff/bookings/{id}/cancel:
+    post:
+      tags: [前台]
+      summary: 前台退订（可标记 venue_fault 场馆原因 → 全额退款、不计爽约）
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+                venue_fault: { type: boolean, default: false }
+      responses:
+        '200': { description: OK }
+
+  /api/admin/venues:
+    get:
+      tags: [运营端]
+      summary: 场馆/场地列表
+      security: [{ staffAuth: [] }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/maintenance:
+    post:
+      tags: [运营端]
+      summary: 场地维护锁定（自动全额退款并关闭时段内已生效订单；未支付订单直接释放）
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [venue_id, court_id, start_time, end_time]
+              properties:
+                venue_id: { type: integer, format: int64 }
+                court_id: { type: integer, format: int64 }
+                start_time: { type: string, format: date-time }
+                end_time: { type: string, format: date-time }
+                reason: { type: string }
+      responses:
+        '201':
+          description: 受影响订单列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  maintenance_id: { type: integer }
+                  affected_bookings:
+                    type: array
+                    items: { type: integer, format: int64 }
+
+  /api/admin/maintenance/{id}/release:
+    post:
+      tags: [运营端]
+      summary: 提前解除维护锁定
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses: { '200': { description: OK } }
+
+  /api/admin/extra-sessions:
+    post:
+      tags: [运营端]
+      summary: 临时加场（开放非常规时段预约）
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [venue_id, court_id, start_time, end_time]
+              properties:
+                venue_id: { type: integer, format: int64 }
+                court_id: { type: integer, format: int64 }
+                start_time: { type: string, format: date-time }
+                end_time: { type: string, format: date-time }
+                note: { type: string }
+      responses:
+        '201': { description: OK }
+        '409': { description: 与维护锁定冲突 }
+
+  /api/admin/extra-sessions/{id}/cancel:
+    post:
+      tags: [运营端]
+      summary: 取消临时加场
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses: { '200': { description: OK } }
+
+  /api/admin/venues/{id}/policy:
+    get:
+      tags: [运营端]
+      summary: 查看运营策略与价格
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses: { '200': { description: OK } }
+    put:
+      tags: [运营端]
+      summary: 更新运营策略（白名单字段）
+      description: |
+        可更新：payment_timeout_min、warmup_minutes、early_entry_minutes、grace_minutes、
+        late_cutoff_minutes、late_fee_ratio、peak_start、peak_end、peak_cancel_free_hours、
+        peak_cancel_fee_ratio、offpeak_cancel_free_hours、offpeak_cancel_fee_ratio、
+        no_show_ban_threshold、max_players、per_extra_player_cents、
+        tier_book_ahead_days（会员优先预约天数）、tier_discount_pct（等级折扣）。
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              example:
+                peak_cancel_free_hours: 24
+                peak_cancel_fee_ratio: 0.5
+                tier_book_ahead_days: { normal: 2, silver: 4, gold: 7 }
+      responses:
+        '200': { description: 更新成功 }
+
+  /api/admin/venues/{id}/prices:
+    put:
+      tags: [运营端]
+      summary: 更新分时段价格（weekday_offpeak/weekday_peak/weekend）
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, hourly_rate_cents]
+              properties:
+                scope: { type: string, enum: [weekday_offpeak, weekday_peak, weekend] }
+                hourly_rate_cents: { type: integer }
+                racket_fee_cents: { type: integer }
+                shuttle_fee_cents: { type: integer }
+      responses: { '200': { description: OK } }
+
+  /api/admin/courts/{id}/status:
+    put:
+      tags: [运营端]
+      summary: 场地状态切换（active/maintenance/disabled）
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { type: string, enum: [active, maintenance, disabled] }
+      responses: { '200': { description: OK } }
+
+  /api/admin/members/{id}/tier:
+    post:
+      tags: [运营端]
+      summary: 调整会员等级（normal/silver/gold，影响优先预约天数与折扣）
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tier: { type: string, enum: [normal, silver, gold] }
+      responses: { '200': { description: OK } }
+
+  /api/admin/members/{id}/unban:
+    post:
+      tags: [运营端]
+      summary: 解除爽约封禁并清零爽约次数
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses: { '200': { description: OK } }
+
+  /api/admin/worker/run-once:
+    post:
+      tags: [运营端]
+      summary: 手动触发一轮调度（超时释放/预热/开关灯/爽约判定）
+      security: [{ staffAuth: [] }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/clock/set:
+    post:
+      tags: [运营端]
+      summary: 【演示/验证】设定虚拟时钟（需 ENABLE_TEST_CLOCK=true）
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                at: { type: string, format: date-time }
+      responses: { '200': { description: OK } }
+
+  /api/admin/clock/reset:
+    post:
+      tags: [运营端]
+      summary: 【演示/验证】恢复真实时钟（需 ENABLE_TEST_CLOCK=true）
+      security: [{ staffAuth: [] }]
+      responses: { '200': { description: OK } }
+
+  /api/cs/bookings:
+    get:
+      tags: [客服争议]
+      summary: 检索订单（order_no / phone / entry_code /date 任选其一）
+      security: [{ staffAuth: [] }]
+      parameters:
+        - { name: order_no, in: query, schema: { type: string } }
+        - { name: phone, in: query, schema: { type: string } }
+        - { name: entry_code, in: query, schema: { type: string } }
+        - { name: date, in: query, schema: { type: string, format: date } }
+      responses: { '200': { description: OK } }
+
+  /api/cs/bookings/{id}/evidence:
+    get:
+      tags: [客服争议]
+      summary: 争议证据包（订单+事件流+台账+支付+维护+退款申请+争议记录）
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      responses:
+        '200':
+          description: 证据包
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvidenceBundle' }
+
+  /api/cs/bookings/{id}/classify-noshow:
+    post:
+      tags: [客服争议]
+      summary: 人工触发爽约判定（返回 no_show/arrived/venue_fault/skipped 与证据）
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/BookingId' }]
+      responses:
+        '200':
+          description: 判定结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NoShowResult' }
+
+  /api/cs/refund-requests:
+    get:
+      tags: [客服争议]
+      summary: 退款申请列表
+      security: [{ staffAuth: [] }]
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, approved, rejected] } }
+      responses: { '200': { description: OK } }
+
+  /api/cs/refund-requests/{id}/decision:
+    post:
+      tags: [客服争议]
+      summary: 审批退款申请
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approve]
+              properties:
+                approve: { type: boolean }
+                note: { type: string }
+      responses: { '200': { description: OK } }
+
+  /api/cs/disputes:
+    post:
+      tags: [客服争议]
+      summary: 开立争议工单
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [booking_id, reason]
+              properties:
+                booking_id: { type: integer, format: int64 }
+                reason: { type: string }
+      responses: { '201': { description: OK } }
+
+  /api/cs/disputes/{id}/resolve:
+    post:
+      tags: [客服争议]
+      summary: 裁决争议（可组合退款/补偿时长/撤销爽约）
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind:
+                  type: string
+                  enum: [refund, comp_time, exonerate, mixed, no_action]
+                refund_amount_cents: { type: integer }
+                comp_minutes: { type: integer, description: 入会员补偿时长账户，后续预约可抵扣 }
+                waive_no_show: { type: boolean, description: 撤销爽约记录并退还罚没、次数 -1 }
+                note: { type: string }
+      responses:
+        '200':
+          description: 结案记录
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dispute' }
+
+components:
+  securitySchemes:
+    staffAuth:
+      type: http
+      scheme: bearer
+    memberAuth:
+      type: http
+      scheme: bearer
+    deviceAuth:
+      type: apiKey
+      in: header
+      name: X-Device-Key
+  parameters:
+    BookingId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+  schemas:
+    Staff:
+      type: object
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        name: { type: string }
+        role: { type: string, enum: [admin, operator, frontdesk, cs] }
+        venue_id: { type: integer, nullable: true }
+    Member:
+      type: object
+      properties:
+        id: { type: integer }
+        phone: { type: string }
+        name: { type: string }
+        member_tier: { type: string, enum: [normal, silver, gold] }
+        no_show_count: { type: integer }
+        banned: { type: boolean }
+    BookingInput:
+      type: object
+      required: [venue_id, court_id, start_time, end_time, player_count]
+      properties:
+        venue_id: { type: integer, format: int64 }
+        court_id: { type: integer, format: int64 }
+        start_time: { type: string, format: date-time }
+        end_time: { type: string, format: date-time }
+        player_count: { type: integer, minimum: 1 }
+        rent_racket: { type: boolean }
+        buy_shuttle: { type: boolean }
+        use_credit_minutes: { type: integer, description: 使用补偿时长（分钟） }
+    QuoteLine:
+      type: object
+      properties:
+        kind: { type: string }
+        amount_cents: { type: integer }
+        minutes: { type: integer }
+        reason: { type: string }
+    Quote:
+      type: object
+      properties:
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/QuoteLine' }
+        slot_cents: { type: integer }
+        discount_cents: { type: integer }
+        credit_cents: { type: integer }
+        credit_minutes: { type: integer }
+        addons_cents: { type: integer }
+        payable_cents: { type: integer }
+        peak: { type: boolean }
+        pay_deadline: { type: string, format: date-time }
+        credit_available_minutes: { type: integer }
+    Booking:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        order_no: { type: string }
+        venue_id: { type: integer }
+        court_id: { type: integer }
+        member_id: { type: integer }
+        member_tier_snapshot: { type: string }
+        start_time: { type: string, format: date-time }
+        end_time: { type: string, format: date-time }
+        player_count: { type: integer }
+        rent_racket: { type: boolean }
+        buy_shuttle: { type: boolean }
+        status:
+          type: string
+          enum: [pending_payment, paid_waiting, warmup, in_play, finished, cancelled, expired, no_show, venue_closed]
+        arrival_status:
+          type: string
+          enum: [unknown, early, ontime, late, waiting, no_show, venue_fault]
+        pay_status: { type: string, enum: [unpaid, paid, partially_refunded, refunded, forfeited] }
+        pay_deadline: { type: string, format: date-time, nullable: true }
+        paid_at: { type: string, format: date-time, nullable: true }
+        entry_code: { type: string, nullable: true }
+        slot_cents: { type: integer }
+        discount_cents: { type: integer }
+        credit_cents: { type: integer }
+        credit_minutes_used: { type: integer }
+        addons_cents: { type: integer }
+        surcharge_cents: { type: integer }
+        paid_cents: { type: integer }
+        refund_cents: { type: integer }
+        gate_opened_at: { type: string, format: date-time, nullable: true }
+        front_signed_at: { type: string, format: date-time, nullable: true }
+        checked_in_at: { type: string, format: date-time, nullable: true }
+        checkin_via: { type: string, nullable: true }
+        light_warmup_at: { type: string, format: date-time, nullable: true }
+        light_on_at: { type: string, format: date-time, nullable: true }
+        light_off_at: { type: string, format: date-time, nullable: true }
+        overtime_minutes: { type: integer }
+        comp_minutes_granted: { type: integer }
+        actual_start_time: { type: string, format: date-time, nullable: true }
+        actual_end_time: { type: string, format: date-time, nullable: true }
+        over_players: { type: integer }
+        no_show_counted: { type: boolean }
+    CancelResult:
+      type: object
+      properties:
+        booking: { $ref: '#/components/schemas/Booking' }
+        fee_cents: { type: integer }
+        refund_cents: { type: integer }
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/LedgerEntry' }
+    LightOffResult:
+      type: object
+      properties:
+        booking: { $ref: '#/components/schemas/Booking' }
+        overtime_minutes: { type: integer }
+        comp_minutes_used: { type: integer }
+        overtime_fee_cents: { type: integer }
+    LedgerEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        booking_id: { type: integer }
+        kind:
+          type: string
+          enum: [slot_fee, racket_fee, shuttle_fee, member_discount, overtime_fee, over_player_fee,
+                 late_fee, cancel_fee, no_show_forfeit, refund_cancel, refund_venue, refund_dispute, comp_time]
+        amount_cents: { type: integer, description: 正数收费 / 负数退款折扣 }
+        minutes: { type: integer }
+        source: { type: string, description: 明确来源，如 system:quote / frontdesk:3 / dispute:2 / maintenance:1 }
+        reason: { type: string }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+    Event:
+      type: object
+      properties:
+        id: { type: integer }
+        booking_id: { type: integer }
+        event_type: { type: string }
+        actor_type: { type: string, enum: [member, system, gate, light, frontdesk, operator, cs] }
+        actor_id: { type: string }
+        payload: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+    EvidenceBundle:
+      type: object
+      properties:
+        booking: { $ref: '#/components/schemas/Booking' }
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/Event' }
+        ledger:
+          type: array
+          items: { $ref: '#/components/schemas/LedgerEntry' }
+        payments:
+          type: array
+          items: { type: object }
+        maintenance:
+          type: array
+          items: { type: object }
+        refund_requests:
+          type: array
+          items: { type: object }
+        disputes:
+          type: array
+          items: { $ref: '#/components/schemas/Dispute' }
+    NoShowResult:
+      type: object
+      properties:
+        booking_id: { type: integer, format: int64 }
+        decision: { type: string, enum: [no_show, arrived, venue_fault, skipped] }
+        evidence: { type: object, additionalProperties: true }
+        forfeit_cents: { type: integer }
+        banned: { type: boolean }
+    Dispute:
+      type: object
+      properties:
+        id: { type: integer }
+        booking_id: { type: integer, format: int64 }
+        opened_by: { type: integer }
+        reason: { type: string }
+        status: { type: string, enum: [open, resolved] }
+        resolution_kind: { type: string, nullable: true, enum: [refund, comp_time, exonerate, mixed, no_action] }
+        refund_amount_cents: { type: integer }
+        comp_minutes: { type: integer }
+        waive_no_show: { type: boolean }
+        decided_by: { type: integer, nullable: true }
+        decision_note: { type: string }
+        created_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time, nullable: true }
