@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>城市体育馆羽毛球预约服务 · API 文档</title>
+  <link rel="stylesheet" href="./swagger-ui.css" />
+  <link rel="icon" href="./favicon-32x32.png" />
+  <style>
+    body { margin: 0; }
+    .topbar { background:#0f2f4f; color:#fff; padding:10px 20px; font:14px/1.4 sans-serif; }
+    .topbar b { font-size:15px; }
+  </style>
+</head>
+<body>
+  <div class="topbar"><b>城市体育馆 · 羽毛球场地预约 / 灯控 / 计费 / 爽约处罚 API</b>　OpenAPI 3.0 · Swagger UI（静态资源已内置，可离线打开）</div>
+  <div id="swagger-ui"></div>
+  <script src="./swagger-ui-bundle.js" charset="UTF-8"></script>
+  <script src="./swagger-ui-standalone-preset.js" charset="UTF-8"></script>
+  <script>
+    window.onload = function() {
+      window.ui = SwaggerUIBundle({
+        url: '/swagger/openapi.yaml',
+        dom_id: '#swagger-ui',
+        deepLinking: true,
+        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+        layout: 'BaseLayout'
+      });
+    };
+  </script>
+</body>
+</html>

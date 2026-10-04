@@ -1,0 +1,8 @@
+# 端到端验证用覆盖配置：关闭进程内自动后台任务，
+# 由 scripts/e2e_test.sh 通过 /internal/jobs/* 显式驱动，保证时序确定。
+# 用法：docker compose -f docker-compose.yml -f docker-compose.verify.yml up -d --build
+services:
+  app:
+    environment:
+      ALLOW_TEST_CLOCK: "true"
+      DISABLE_BG_JOBS: "true"
